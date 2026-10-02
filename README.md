@@ -56,6 +56,21 @@ applet records over time in `~/.config/deepseek-balance/history.json`:
 - token counts are not available from the API — the platform dashboard shows
   them per API key.
 
+## Privacy and your API key
+
+The applet's only network traffic is HTTPS requests to DeepSeek's official
+balance endpoint (`api.deepseek.com/user/balance`), carrying your API key in
+the request header. It goes to DeepSeek and nowhere else — no telemetry, no
+analytics, no third-party service — and it's encrypted in transit by TLS.
+
+The key itself is stored locally, in Cinnamon's per-applet settings directory
+(`~/.config/cinnamon/spices/deepseek-balance@njoro410/`), as plain text, the
+same way most CLI tools keep credentials. Treat it as a secret on your
+machine, and if it ever leaks, delete it at
+[platform.deepseek.com](https://platform.deepseek.com/api_keys) and issue a
+new one. Spend history stays local too — it lives in
+`~/.config/deepseek-balance/history.json`.
+
 ## Peak-hour pricing
 
 DeepSeek bills API usage at 2× during peak hours — Monday to Friday,
