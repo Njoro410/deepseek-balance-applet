@@ -45,7 +45,8 @@ Right-click the applet → **Configure…**
 The only official API-key endpoint is
 `GET https://api.deepseek.com/user/balance`, which reports the balance — not
 token counts. Spend figures are therefore inferred from balance changes the
-applet records over time in `~/.config/deepseek-balance/history.json`:
+applet records over time in
+`~/.local/state/deepseek-balance@njoro410/history.json`:
 
 - only decreases count as spend (top-ups are ignored);
 - the paid/granted split describes the *current* balance, not your original
@@ -69,7 +70,7 @@ same way most CLI tools keep credentials. Treat it as a secret on your
 machine, and if it ever leaks, delete it at
 [platform.deepseek.com](https://platform.deepseek.com/api_keys) and issue a
 new one. Spend history stays local too — it lives in
-`~/.config/deepseek-balance/history.json`.
+`~/.local/state/deepseek-balance@njoro410/history.json`.
 
 ## Peak-hour pricing
 
@@ -85,8 +86,9 @@ doubt.
 
 ```sh
 node --check deepseek-balance@njoro410/applet.js   # syntax
-node test/history-test.js                       # history/spend math
-./install.sh                                    # then remove + re-add the applet
+node test/history-test.js                          # spend/formatting math
+cjs test/history-io-test.js                        # history file I/O (async)
+./install.sh                                       # then remove + re-add the applet
 ```
 
 The applet source of truth is this directory; `install.sh` copies it into

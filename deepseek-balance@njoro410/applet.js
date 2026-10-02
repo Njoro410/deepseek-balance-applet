@@ -28,8 +28,10 @@ const BAR_WIDTH_PX = 60;
 const BAR_HEIGHT_PX = 10;
 const WARN_COLOR = 'color: #e01b24;';
 
-const HISTORY_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'deepseek-balance']);
+const HISTORY_DIR = GLib.build_filenamev([GLib.get_user_state_dir(), UUID]);
 const HISTORY_PATH = GLib.build_filenamev([HISTORY_DIR, 'history.json']);
+// Pre-release builds kept the history under ~/.config/deepseek-balance; migrate it.
+const LEGACY_HISTORY_PATH = GLib.build_filenamev([GLib.get_user_config_dir(), 'deepseek-balance', 'history.json']);
 
 Gettext.bindtextdomain(UUID, GLib.get_home_dir() + '/.local/share/locale');
 function _(str) {
@@ -45,7 +47,12 @@ const SAMPLE_HEARTBEAT_SECONDS = 12 * 3600;
 const MAX_SAMPLES = 5000;
 const CENTS = 0.005; // balance deltas smaller than this count as "unchanged"
 const DEFAULT_BAR_COLOR = '#4d6bfe'; // DeepSeek blue; kept in sync with settings-schema.json
-const DEFAULT_PEAK_COLOR = '#ff7800'; // peak-hours logo tint; kept in sync with settings-schema.json
+// The peak-logo-color options from settings-schema.json. A pre-rendered tinted
+// variant (icon-peak-<hex>.svg) is shipped in the applet directory for each.
+const PEAK_ICON_COLORS = [
+    '#ff7800', '#4d6bfe', '#3584e4', '#009688', '#33d17a',
+    '#f6d32d', '#e01b24', '#e91e63', '#9141ac', '#9a9996',
+];
 
 const CURRENCY_SYMBOLS = { CNY: '¥', USD: '$' };
 const DAY_SECONDS = 86400;
@@ -139,6 +146,14 @@ function parseHexColor(value) {
     return { r: ((n >> 16) & 0xff) / 255, g: ((n >> 8) & 0xff) / 255, b: (n & 0xff) / 255 };
 }
 
+// File name of the shipped tinted logo for a peak-logo-color value, or null
+// when the value is not one of the palette colors.
+function peakIconFile(color) {
+    const hex = typeof color === 'string' ? color.trim().toLowerCase() : '';
+    if (PEAK_ICON_COLORS.indexOf(hex) === -1) return null;
+    return 'icon-peak-' + hex.slice(1) + '.svg';
+}
+
 // DeepSeek bills API usage at 2× during peak hours — Monday to Friday,
 // 09:00–12:00 and 14:00–18:00 Beijing time (UTC+8), i.e. 01:00–04:00 and
 // 06:00–10:00 UTC. Everything else is off-peak at half price; weekends are
@@ -211,6 +226,99 @@ function roundedRect(cr, x, y, w, h, r) {
 }
 // ===== pure-logic:end =====
 
+// ===== history-io:start =====
+// Asynchronous read/write of the spend-history JSON file, kept free of applet
+// state so test/history-io-test.js can exercise it under cjs.
+
+// Reads a JSON file; the callback gets the parsed object, or null when the
+// file is missing, unreadable or invalid.
+function readJsonFile(path, callback) {
+    Gio.File.new_for_path(path).load_contents_async(null, (file, result) => {
+        let contents = null;
+        try {
+            const [ok, data] = file.load_contents_finish(result);
+            if (ok) contents = data;
+        } catch (e) { /* missing or unreadable */ }
+        if (!contents) {
+            callback(null);
+            return;
+        }
+        let parsed = null;
+        try {
+            parsed = JSON.parse(new TextDecoder().decode(contents));
+        } catch (e) {
+            global.logWarning('[' + UUID + '] could not parse ' + path + ': ' + e.message);
+        }
+        callback(parsed && typeof parsed === 'object' ? parsed : null);
+    });
+}
+
+// Creates a directory and any missing parents, asynchronously (GIO only has
+// an async single-level make_directory).
+function ensureDirAsync(dir, callback) {
+    const file = Gio.File.new_for_path(dir);
+    file.make_directory_async(GLib.PRIORITY_DEFAULT, null, (f, result) => {
+        try {
+            f.make_directory_finish(result);
+            callback();
+        } catch (e) {
+            if (e && e.matches && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.EXISTS)) {
+                callback();
+                return;
+            }
+            const parent = f.get_parent();
+            if (parent && e && e.matches && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+                ensureDirAsync(parent.get_path(), () => ensureDirAsync(dir, callback));
+                return;
+            }
+            global.logWarning('[' + UUID + '] could not create ' + dir + ': ' + e.message);
+            callback();
+        }
+    });
+}
+
+// Writes data as JSON, creating the directory on first use. Writes are
+// coalesced: data handed over while a write is in flight replaces whatever is
+// waiting, so one final write carries the latest state instead of racing the
+// current one. `state` is a plain object owned by the caller
+// ({inFlight, pending, dirReady}).
+function writeJsonFile(path, dir, data, state, callback) {
+    if (state.inFlight) {
+        state.pending = data;
+        return;
+    }
+    state.inFlight = true;
+    const write = (payload) => {
+        const bytes = new GLib.Bytes(JSON.stringify(payload));
+        Gio.File.new_for_path(path).replace_contents_bytes_async(
+            bytes, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null,
+            (file, result) => {
+                try {
+                    file.replace_contents_finish(result);
+                } catch (e) {
+                    global.logWarning('[' + UUID + '] could not save history: ' + e.message);
+                }
+                if (state.pending) {
+                    const again = state.pending;
+                    state.pending = null;
+                    write(again);
+                    return;
+                }
+                state.inFlight = false;
+                if (callback) callback();
+            });
+    };
+    if (state.dirReady) {
+        write(data);
+        return;
+    }
+    ensureDirAsync(dir, () => {
+        state.dirReady = true;
+        write(data);
+    });
+}
+// ===== history-io:end =====
+
 function DeepSeekBalanceApplet(metadata, orientation, panel_height, instance_id) {
     this._init(metadata, orientation, panel_height, instance_id);
 }
@@ -225,10 +333,9 @@ DeepSeekBalanceApplet.prototype = {
 
         // DeepSeek logo in the panel, to the left of the label/bar. During
         // peak-rate hours a tinted copy replaces it (see _updatePricing).
+        this._appletDir = metadata.path;
         this._iconNormalPath = metadata.path + '/icon.svg';
         this._lastIconPath = this._iconNormalPath;
-        this._iconSource = null;
-        this._iconErrorLogged = false;
         this._peakTimer = 0;
         this.set_applet_icon_path(this._iconNormalPath);
 
@@ -241,7 +348,9 @@ DeepSeekBalanceApplet.prototype = {
         this._updated = null;  // Date of last successful fetch
         this._barPercent = 0;
         this._barLow = false;
-        this._history = this._loadHistory();
+        this._history = {};
+        this._historyLoaded = false;
+        this._saveState = { inFlight: false, pending: null, dirReady: false };
 
         this._session = new Soup.Session();
         this._session.timeout = 30;
@@ -270,7 +379,7 @@ DeepSeekBalanceApplet.prototype = {
                 try {
                     this[prop] = this.settings.getValue(key);
                 } catch (e) {
-                    global.log('[deepseek-balance] could not read setting ' + key + ': ' + e.message);
+                    global.logWarning('[' + UUID + '] could not read setting ' + key + ': ' + e.message);
                 }
             }
         }
@@ -279,8 +388,12 @@ DeepSeekBalanceApplet.prototype = {
         this._ready = true;
 
         this._render();
-        this._restartTimer();
-        this._refresh();
+        this._loadHistory(() => {
+            this._historyLoaded = true;
+            this._restartTimer();
+            this._refresh();
+            this._render();
+        });
         global.log('[' + UUID + '] loaded instance ' + instance_id);
     },
 
@@ -367,41 +480,20 @@ DeepSeekBalanceApplet.prototype = {
 
     _pricingText: function () {
         const now = new Date();
-        let text = isPeakTime(now) ? _('Peak hours — 2× the off-peak price') : _('Off-peak — half price');
+        const state = isPeakTime(now)
+            ? _('Peak hours — 2× the off-peak price')
+            : _('Off-peak — half price');
         const next = nextPricingChange(now);
-        if (next) {
-            text += _(' until ') + formatClock(next.t, now) +
-                ' (' + _('in ') + formatDuration(next.t - now.getTime() / 1000) + ')';
-        }
-        return text;
+        if (!next) return state;
+        return _('%s until %s (in %s)').format(
+            state, formatClock(next.t, now), formatDuration(next.t - now.getTime() / 1000));
     },
 
-    // A tinted copy of icon.svg, generated once per color into the cache dir.
-    // The color is in the filename so the shell's icon cache can't go stale.
+    // Path of the pre-rendered tinted logo for a peak color, or null when the
+    // color is not one of the shipped variants.
     _peakIconPath: function (color) {
-        try {
-            if (!this._iconSource) {
-                const [ok, contents] = Gio.File.new_for_path(this._iconNormalPath).load_contents(null);
-                if (!ok) return null;
-                this._iconSource = new TextDecoder().decode(contents);
-            }
-            const hex = parseHexColor(color) ? color.trim().toLowerCase() : DEFAULT_PEAK_COLOR;
-            const dir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'deepseek-balance']);
-            const path = GLib.build_filenamev([dir, 'icon-' + hex.slice(1) + '.svg']);
-            const file = Gio.File.new_for_path(path);
-            if (!file.query_exists(null)) {
-                GLib.mkdir_with_parents(dir, 0o700);
-                const svg = this._iconSource.replace(/fill="#[0-9a-fA-F]{6}"/, 'fill="' + hex + '"');
-                file.replace_contents(svg, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
-            }
-            return path;
-        } catch (e) {
-            if (!this._iconErrorLogged) {
-                this._iconErrorLogged = true;
-                global.logWarning('[' + UUID + '] could not create the peak-hours logo: ' + e.message);
-            }
-            return null;
-        }
+        const file = peakIconFile(color);
+        return file ? GLib.build_filenamev([this._appletDir, file]) : null;
     },
 
     _onSettingsChanged: function () {
@@ -423,12 +515,12 @@ DeepSeekBalanceApplet.prototype = {
         const minutes = Math.max(1, parseInt(this.refreshInterval, 10) || 5);
         this._timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, minutes * 60, () => {
             this._refresh();
-            return true;
+            return GLib.SOURCE_CONTINUE;
         });
     },
 
     _refresh: function () {
-        if (this._destroyed || this._fetching) return;
+        if (this._destroyed || this._fetching || !this._historyLoaded) return;
 
         const key = (this.apiKey || '').trim();
         if (!key) {
@@ -450,13 +542,13 @@ DeepSeekBalanceApplet.prototype = {
             try {
                 bytes = session.send_and_read_finish(result);
             } catch (e) {
-                this._fail(_('Network error: ') + e.message);
+                this._fail(_('Network error: %s').format(e.message));
                 return;
             }
 
             const status = message.get_status();
             if (status === 401 || status === 403) {
-                this._fail(_('Invalid API key (HTTP ') + status + ')');
+                this._fail(_('Invalid API key (HTTP %s)').format(status));
                 return;
             }
             if (status === 429) {
@@ -464,7 +556,7 @@ DeepSeekBalanceApplet.prototype = {
                 return;
             }
             if (status !== Soup.Status.OK) {
-                this._fail(_('API error: HTTP ') + status);
+                this._fail(_('API error: HTTP %s').format(status));
                 return;
             }
 
@@ -553,27 +645,29 @@ DeepSeekBalanceApplet.prototype = {
     },
 
     _tooltipText: function () {
-        const lines = ['DeepSeek API balance'];
+        const lines = [_('DeepSeek API balance')];
         const result = this._result;
 
         if (this._error) lines.push('⚠ ' + this._error);
 
         if (result) {
-            lines.push('Balance: ' + formatAmount(result.total, result.currency) + ' ' + result.currency);
+            lines.push(_('Balance: %s %s').format(formatAmount(result.total, result.currency), result.currency));
             // toppedUp/granted describe the current balance (paid vs free
             // credits), not the original top-up total — the API has no such field.
-            lines.push('Of which paid: ' + formatAmount(result.toppedUp, result.currency) +
-                '  ·  granted: ' + formatAmount(result.granted, result.currency));
-            lines.push(result.available ? 'Available for API calls: yes' : 'Available for API calls: NO');
+            lines.push(_('Of which paid: %s · granted: %s').format(
+                formatAmount(result.toppedUp, result.currency),
+                formatAmount(result.granted, result.currency)));
+            lines.push(result.available ? _('Available for API calls: yes') : _('Available for API calls: NO'));
             lines.push(this._pricingText());
 
             const reference = parseFloat(this.referenceAmount) || 0;
             lines.push('');
             if (reference > 0) {
                 const percent = (result.total / reference) * 100;
-                lines.push(percent.toFixed(1) + '% of ' + formatAmount(reference, result.currency) + ' reference remaining');
+                lines.push(_('%s of %s reference remaining').format(
+                    percent.toFixed(1) + '%', formatAmount(reference, result.currency)));
             } else {
-                lines.push('Set a reference amount in Configure… to show a percentage.');
+                lines.push(_('Set a reference amount in Configure… to show a percentage.'));
             }
 
             const series = this._history[result.currency];
@@ -582,51 +676,52 @@ DeepSeekBalanceApplet.prototype = {
                 const today = spentSince(series, startOfToday(nowSec));
                 const week = spentSince(series, nowSec - 7 * DAY_SECONDS);
                 const month = spentSince(series, nowSec - 30 * DAY_SECONDS);
-                lines.push('Spent today: ' + formatAmount(today, result.currency));
-                lines.push('Spent last 7 days: ' + formatAmount(week, result.currency));
-                lines.push('Spent last 30 days: ' + formatAmount(month, result.currency));
+                lines.push(_('Spent today: %s').format(formatAmount(today, result.currency)));
+                lines.push(_('Spent last 7 days: %s').format(formatAmount(week, result.currency)));
+                lines.push(_('Spent last 30 days: %s').format(formatAmount(month, result.currency)));
 
                 const rate = week / 7;
                 if (rate > 0.001 && result.total > 0) {
                     const daysLeft = result.total / rate;
                     if (daysLeft > 365) {
-                        lines.push('More than a year of balance left at the last 7 days\' rate');
+                        lines.push(_('More than a year of balance left at the last 7 days\' rate'));
                     } else {
-                        lines.push('≈ ' + (daysLeft >= 10 ? Math.round(daysLeft) : daysLeft.toFixed(1)) +
-                            ' days left at the last 7 days\' rate');
+                        lines.push(_('≈ %s days left at the last 7 days\' rate').format(
+                            daysLeft >= 10 ? Math.round(daysLeft) : daysLeft.toFixed(1)));
                     }
                 } else if (week === 0) {
-                    lines.push('No spend recorded in the last 7 days');
+                    lines.push(_('No spend recorded in the last 7 days'));
                 }
-                lines.push('(inferred from balance changes; the API does not expose token counts)');
+                lines.push(_('(inferred from balance changes; the API does not expose token counts)'));
             } else {
                 lines.push('');
-                lines.push('Spend tracking starts once a few balance samples are in.');
+                lines.push(_('Spend tracking starts once a few balance samples are in.'));
             }
         } else if (!this._error) {
-            lines.push('No data yet.');
+            lines.push(_('No data yet.'));
         }
 
         const minutes = Math.max(1, parseInt(this.refreshInterval, 10) || 5);
         const when = this._updated
             ? this._updated.getHours() + ':' + String(this._updated.getMinutes()).padStart(2, '0')
-            : 'never';
+            : _('never');
         lines.push('');
-        lines.push('Updated ' + when + ' · refreshes every ' + minutes + ' min');
+        lines.push(_('Updated %s · refreshes every %s min').format(when, minutes));
         return lines.join('\n');
     },
 
     _updateMenu: function () {
         const result = this._result;
         this._menuStatus.label.text = result
-            ? _('Balance: ') + formatAmount(result.total, result.currency) + ' ' + result.currency
+            ? _('Balance: %s %s').format(formatAmount(result.total, result.currency), result.currency)
             : _('Balance: —');
 
         const series = result && Array.isArray(this._history[result.currency]) ? this._history[result.currency] : null;
         if (series && series.length > 1) {
             const nowSec = Math.floor(Date.now() / 1000);
-            this._menuSpent.label.text = _('Spent today: ') + formatAmount(spentSince(series, startOfToday(nowSec)), result.currency) +
-                '   ·   ' + _('7 days: ') + formatAmount(spentSince(series, nowSec - 7 * DAY_SECONDS), result.currency);
+            this._menuSpent.label.text = _('Spent today: %s   ·   7 days: %s').format(
+                formatAmount(spentSince(series, startOfToday(nowSec)), result.currency),
+                formatAmount(spentSince(series, nowSec - 7 * DAY_SECONDS), result.currency));
         } else {
             this._menuSpent.label.text = this._error ? this._error : _('Gathering spend data…');
         }
@@ -634,27 +729,29 @@ DeepSeekBalanceApplet.prototype = {
         this._menuPricing.label.text = this._pricingText();
     },
 
-    _loadHistory: function () {
-        try {
-            if (!GLib.file_test(HISTORY_PATH, GLib.FileTest.EXISTS)) return {};
-            const [ok, contents] = GLib.file_get_contents(HISTORY_PATH);
-            if (!ok) return {};
-            const data = JSON.parse(new TextDecoder().decode(contents));
-            return (data && typeof data === 'object') ? data : {};
-        } catch (e) {
-            global.log('[deepseek-balance] could not read history: ' + e.message);
-            return {};
-        }
+    // ===== history-io-methods:start =====
+    _loadHistory: function (callback) {
+        readJsonFile(HISTORY_PATH, (data) => {
+            if (data) {
+                this._history = data;
+                callback();
+                return;
+            }
+            readJsonFile(LEGACY_HISTORY_PATH, (legacy) => {
+                // Pre-release builds kept the history in the config dir; move it.
+                if (legacy) {
+                    this._history = legacy;
+                    this._saveHistory();
+                }
+                callback();
+            });
+        });
     },
 
     _saveHistory: function () {
-        try {
-            GLib.mkdir_with_parents(HISTORY_DIR, 0o700);
-            GLib.file_set_contents(HISTORY_PATH, JSON.stringify(this._history));
-        } catch (e) {
-            global.log('[deepseek-balance] could not save history: ' + e.message);
-        }
+        writeJsonFile(HISTORY_PATH, HISTORY_DIR, this._history, this._saveState);
     },
+    // ===== history-io-methods:end =====
 
     on_applet_clicked: function (event) {
         this._applet_context_menu.toggle();

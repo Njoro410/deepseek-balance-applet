@@ -20,7 +20,7 @@ const section = source.slice(start, end);
 const load = new Function(
     section +
     '\nreturn { formatAmount, parseBalanceResponse, appendSample, pruneSamples,' +
-    ' spentSince, startOfToday, clampPercent, parseHexColor,' +
+    ' spentSince, startOfToday, clampPercent, parseHexColor, peakIconFile, PEAK_ICON_COLORS,' +
     ' isPeakTime, nextPricingChange, formatClock, formatDuration };'
 );
 const lib = load();
@@ -124,6 +124,20 @@ eq(lib.parseHexColor('  #3584e4 '), { r: 0x35 / 255, g: 0x84 / 255, b: 0xe4 / 25
 eq(lib.parseHexColor('#abc'), null, 'rejects shorthand hex');
 eq(lib.parseHexColor('4d6bfe'), null, 'requires the leading #');
 eq(lib.parseHexColor(null), null, 'rejects non-strings');
+
+// --- peakIconFile -------------------------------------------------------
+eq(lib.peakIconFile('#ff7800'), 'icon-peak-ff7800.svg', 'maps a palette color to its icon file');
+eq(lib.peakIconFile('  #4D6BFE '), 'icon-peak-4d6bfe.svg', 'trims and lowercases before matching');
+eq(lib.peakIconFile('#123456'), null, 'unknown color has no pre-rendered icon');
+eq(lib.peakIconFile(null), null, 'non-strings have no icon');
+{
+    const appletDir = path.join(__dirname, '..', 'deepseek-balance@njoro410');
+    for (const hex of lib.PEAK_ICON_COLORS) {
+        const file = lib.peakIconFile(hex);
+        eq(fs.existsSync(path.join(appletDir, file)), true, `shipped icon exists for ${hex}`);
+    }
+    eq(new Set(lib.PEAK_ICON_COLORS).size, lib.PEAK_ICON_COLORS.length, 'palette has no duplicates');
+}
 
 // --- isPeakTime ---------------------------------------------------------
 // 2026-10-05 is a Monday; peak windows are 01:00–04:00 and 06:00–10:00 UTC.
