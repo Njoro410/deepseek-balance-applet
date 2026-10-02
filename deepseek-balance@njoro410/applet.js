@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // DeepSeek Balance — Cinnamon applet
 //
 // Shows the DeepSeek API account balance in the panel (percentage, bar, or
