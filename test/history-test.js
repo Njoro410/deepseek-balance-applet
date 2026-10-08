@@ -21,7 +21,8 @@ const load = new Function(
     section +
     '\nreturn { formatAmount, parseBalanceResponse, appendSample, pruneSamples,' +
     ' spentSince, startOfToday, clampPercent, parseHexColor, peakIconFile, PEAK_ICON_COLORS,' +
-    ' isPeakTime, nextPricingChange, formatClock, formatDuration };'
+    ' isPeakTime, nextPricingChange, formatClock, formatDuration,' +
+    ' updatePeak, normalizeHistory, effectiveReference };'
 );
 const lib = load();
 
@@ -74,6 +75,45 @@ eq(lib.spentSince([{ t: 0, b: 100 }], 0), 0,
     eq(samples[1].t >= cutoff, true, 'drops samples older than the cutoff');
     eq(samples[samples.length - 1].t, now, 'keeps the newest sample');
 }
+
+// --- updatePeak ---------------------------------------------------------
+{
+    const peaks = {};
+    eq(lib.updatePeak(peaks, 'USD', 10), true, 'a first balance becomes the peak');
+    eq(peaks.USD, 10, 'the peak is stored per currency');
+    eq(lib.updatePeak(peaks, 'USD', 9.5), false, 'a smaller balance leaves the peak alone');
+    eq(peaks.USD, 10, 'spending never lowers the peak');
+    eq(lib.updatePeak(peaks, 'USD', 17.75), true, 'a top-up raises the peak');
+    eq(peaks.USD, 17.75, 'the peak takes the topped-up balance');
+    eq(lib.updatePeak(peaks, 'USD', 17.75), false, 'an unchanged balance does not dirty the file');
+    eq(lib.updatePeak(peaks, 'CNY', 3), true, 'currencies keep separate peaks');
+    eq(lib.updatePeak(peaks, 'USD', 0), false, 'a zero balance does not become a peak');
+}
+
+// --- normalizeHistory ---------------------------------------------------
+{
+    const legacy = { CNY: [{ t: 1000, b: 42.5 }, { t: 2000, b: 41 }] };
+    eq(lib.normalizeHistory(legacy), { CNY: legacy.CNY, _peaks: { CNY: 42.5 } },
+        'a file without _peaks gets the highest sample as its peak');
+    eq(lib.normalizeHistory({ USD: [{ t: 1, b: 5 }], _peaks: { USD: 99 } })._peaks, { USD: 99 },
+        'a stored peak survives even when no sample reaches it (pruned top-up)');
+    eq(lib.normalizeHistory({ USD: [{ t: 1, b: 5 }], _peaks: { USD: 2 } })._peaks, { USD: 5 },
+        'a stale stored peak is raised to the highest sample');
+    eq(lib.normalizeHistory({ _peaks: null })._peaks, {}, 'a broken _peaks value is replaced by an empty map');
+    eq(lib.normalizeHistory({ USD: 'junk', _peaks: { USD: 4 } })._peaks, { USD: 4 },
+        'a non-array currency entry is ignored');
+    eq(lib.normalizeHistory(null), { _peaks: {} }, 'null yields an empty history');
+    eq(lib.normalizeHistory({ USD: [{ t: 1, b: 5 }], _peaks: {} }), { USD: [{ t: 1, b: 5 }], _peaks: { USD: 5 } },
+        'an empty _peaks map is filled from the samples');
+}
+
+// --- effectiveReference -------------------------------------------------
+eq(lib.effectiveReference(0, 17.75), 17.75, 'with no configured amount the peak is the reference');
+eq(lib.effectiveReference(10, 17.75), 10, 'a configured amount wins over the peak');
+eq(lib.effectiveReference('10', 17.75), 10, 'a string amount from the settings JSON is parsed');
+eq(lib.effectiveReference(0, 0), 0, 'no amount and no peak leaves the reference unknown');
+eq(lib.effectiveReference(-5, 4), 4, 'a negative amount falls back to the peak');
+eq(lib.effectiveReference(NaN, 4), 4, 'a malformed amount falls back to the peak');
 
 // --- parseBalanceResponse ----------------------------------------------
 const apiResponse = {

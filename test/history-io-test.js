@@ -67,12 +67,20 @@ const io = new Function('GLib', 'Gio', 'UUID', 'global', 'TextDecoder',
     '\nreturn { readJsonFile, writeJsonFile };'
 )(GLib, Gio, UUID, shim, TextDecoder);
 
+// _loadHistory repairs what it reads, so it needs the pure-logic helpers.
+const pure = new Function(
+    slice('// ===== pure-logic:start =====', '// ===== pure-logic:end =====') +
+    '\nreturn { normalizeHistory };'
+)();
+
 const methods = new Function(
-    'readJsonFile', 'writeJsonFile', 'HISTORY_PATH', 'HISTORY_DIR', 'LEGACY_HISTORY_PATH',
+    'readJsonFile', 'writeJsonFile', 'normalizeHistory',
+    'HISTORY_PATH', 'HISTORY_DIR', 'LEGACY_HISTORY_PATH',
     'return {' +
     slice('// ===== history-io-methods:start =====', '// ===== history-io-methods:end =====') +
     '};'
-)(io.readJsonFile, io.writeJsonFile, paths.HISTORY_PATH, paths.HISTORY_DIR, paths.LEGACY_HISTORY_PATH);
+)(io.readJsonFile, io.writeJsonFile, pure.normalizeHistory,
+  paths.HISTORY_PATH, paths.HISTORY_DIR, paths.LEGACY_HISTORY_PATH);
 
 let checks = 0;
 let failures = 0;
@@ -93,7 +101,7 @@ function eq(actual, expected, msg) {
 
 function makeApplet() {
     const applet = Object.create(methods);
-    applet._history = {};
+    applet._history = { _peaks: {} };
     applet._saveState = { inFlight: false, pending: null, dirReady: false };
     return applet;
 }
@@ -141,21 +149,22 @@ const steps = [];
 steps.push(done => {
     const applet = makeApplet();
     applet._loadHistory(() => {
-        eq(applet._history, {}, 'missing history file yields an empty object');
+        eq(applet._history, { _peaks: {} }, 'missing history file yields an empty history');
         done();
     });
 });
 
 // --- a pre-release history in the config dir is migrated ----------------
 const legacyData = { CNY: [{ t: 1000, b: 42.5 }, { t: 2000, b: 41 }] };
+const legacyExpected = { CNY: legacyData.CNY, _peaks: { CNY: 42.5 } };
 steps.push(done => {
     GLib.mkdir_with_parents(GLib.path_get_dirname(paths.LEGACY_HISTORY_PATH), 0o700);
     GLib.file_set_contents(paths.LEGACY_HISTORY_PATH, JSON.stringify(legacyData));
     const applet = makeApplet();
     applet._loadHistory(() => {
-        eq(applet._history, legacyData, 'legacy history is loaded');
+        eq(applet._history, legacyExpected, 'legacy history is loaded with its peak derived from the samples');
         waitUntil(() => readJson(paths.HISTORY_PATH) !== null, () => {
-            eq(readJson(paths.HISTORY_PATH), legacyData, 'legacy history is copied to the state dir');
+            eq(readJson(paths.HISTORY_PATH), legacyExpected, 'legacy history is copied to the state dir');
             check(GLib.file_test(paths.LEGACY_HISTORY_PATH, GLib.FileTest.EXISTS),
                 'the legacy file is left in place');
             done();
@@ -164,7 +173,7 @@ steps.push(done => {
 });
 
 // --- saving writes the history JSON -------------------------------------
-const savedData = { USD: [{ t: 10, b: 7.25 }], CNY: [{ t: 20, b: 3 }] };
+const savedData = { USD: [{ t: 10, b: 7.25 }], CNY: [{ t: 20, b: 3 }], _peaks: { USD: 12, CNY: 3 } };
 steps.push(done => {
     const applet = makeApplet();
     applet._history = savedData;
@@ -198,7 +207,31 @@ steps.push(done => {
     GLib.file_set_contents(paths.HISTORY_PATH, '{not json');
     const applet = makeApplet();
     applet._loadHistory(() => {
-        eq(applet._history, {}, 'corrupt history yields an empty object');
+        eq(applet._history, { _peaks: {} }, 'corrupt history yields an empty history');
+        done();
+    });
+});
+
+// --- a file written before _peaks existed gains one on load -------------
+steps.push(done => {
+    GLib.file_set_contents(paths.HISTORY_PATH,
+        JSON.stringify({ USD: [{ t: 1, b: 5 }, { t: 2, b: 17.75 }, { t: 3, b: 17.5 }] }));
+    const applet = makeApplet();
+    applet._loadHistory(() => {
+        eq(applet._history._peaks, { USD: 17.75 },
+            'the peak is derived from the samples of a file without _peaks');
+        done();
+    });
+});
+
+// --- a stored peak is not lowered by the samples ------------------------
+// (the top-up sample that raised it may already have been pruned)
+steps.push(done => {
+    GLib.file_set_contents(paths.HISTORY_PATH,
+        JSON.stringify({ USD: [{ t: 1, b: 5 }], _peaks: { USD: 99 } }));
+    const applet = makeApplet();
+    applet._loadHistory(() => {
+        eq(applet._history._peaks, { USD: 99 }, 'a stored peak is kept even when no sample reaches it');
         done();
     });
 });
